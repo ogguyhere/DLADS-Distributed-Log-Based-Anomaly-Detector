@@ -18,53 +18,56 @@ endif()
 
 find_package(Threads REQUIRED)
 
-# ── Third-party dependencies ──────────────────────────────────────────────────
-include(FetchContent)
+# nlohmann/json
+find_package(nlohmann_json QUIET)
+if(NOT nlohmann_json_FOUND)
+  add_library(nlohmann_json INTERFACE)
+  target_include_directories(nlohmann_json INTERFACE ${CMAKE_SOURCE_DIR}/include)
+  add_library(nlohmann_json::nlohmann_json ALIAS nlohmann_json)
+endif()
 
-# nlohmann/json — header-only, used by alert_event
-FetchContent_Declare(
-  nlohmann_json
-  GIT_REPOSITORY https://github.com/nlohmann/json.git
-  GIT_TAG        v3.11.3
-  GIT_SHALLOW    TRUE
-)
-FetchContent_MakeAvailable(nlohmann_json)
+# ZeroMQ
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(ZMQ REQUIRED libzmq)
+
+# cppzmq — header only, already in include/
+add_library(cppzmq INTERFACE)
+target_include_directories(cppzmq INTERFACE ${CMAKE_SOURCE_DIR}/include)
 
 # GoogleTest
-FetchContent_Declare(
-  googletest
-  GIT_REPOSITORY https://github.com/google/googletest.git
-  GIT_TAG        v1.14.0
-  GIT_SHALLOW    TRUE
-)
-set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(googletest)
+find_package(GTest REQUIRED)
 
-# ── Include paths ─────────────────────────────────────────────────────────────
+# Include paths
 include_directories(include)
 
-# ── dlads_core ────────────────────────────────────────────────────────────────
+# dlads_core
 add_library(dlads_core STATIC
   src/log_tailer.cpp
   src/log_parser.cpp
+  src/log_event.cpp
   src/alert_event.cpp
 )
 target_include_directories(dlads_core PUBLIC include)
 target_link_libraries(dlads_core PUBLIC
   Threads::Threads
   nlohmann_json::nlohmann_json
+  ${ZMQ_LIBRARIES}
+  cppzmq
 )
 
-# ── Agent binary ──────────────────────────────────────────────────────────────
+# Agent binary
 add_executable(dlads_agent src/agent_main.cpp)
 target_link_libraries(dlads_agent PRIVATE dlads_core)
 
-# ── Tests ─────────────────────────────────────────────────────────────────────
+# Subscriber binary (Person B)
+add_executable(dlads_subscriber src/subscriber.cpp)
+target_link_libraries(dlads_subscriber PRIVATE dlads_core ${ZMQ_LIBRARIES} cppzmq)
+
+# Tests
 enable_testing()
 
 add_executable(test_ring_buffer tests/test_ring_buffer.cpp)
-target_include_directories(test_ring_buffer PRIVATE include)
-target_link_libraries(test_ring_buffer PRIVATE GTest::gtest_main)
+target_link_libraries(test_ring_buffer PRIVATE dlads_core GTest::gtest_main)
 add_test(NAME RingBufferTests COMMAND test_ring_buffer)
 
 add_executable(test_log_tailer tests/test_log_tailer.cpp)
@@ -78,3 +81,7 @@ add_test(NAME LogParserTests COMMAND test_log_parser)
 add_executable(test_alert_event tests/test_alert_event.cpp)
 target_link_libraries(test_alert_event PRIVATE dlads_core GTest::gtest_main)
 add_test(NAME AlertEventTests COMMAND test_alert_event)
+
+add_executable(test_zscore tests/test_zscore.cpp)
+target_link_libraries(test_zscore PRIVATE dlads_core GTest::gtest_main)
+add_test(NAME ZScoreTests COMMAND test_zscore)
