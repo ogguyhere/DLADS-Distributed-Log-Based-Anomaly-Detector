@@ -1,0 +1,9 @@
+# dlads agent configuration — populated per milestone
+
+agent:
+  host_id: "localhost"
+
+# Stage 2 will add:
+# tailer:
+#   watch_path: "/var/log/auth.log"
+#   poll_interval_ms: 100
