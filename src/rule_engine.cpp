@@ -1,349 +1,500 @@
 #include "dlads/rule_engine.hpp"
-#include "dlads/alert_event.hpp"
 
 #include <algorithm>
-#include <chrono>
+#include <cctype>
+#include <charconv>
 #include <fstream>
+#include <iostream>
 #include <set>
 #include <sstream>
-#include <string>
-#include <unordered_map>
 
 namespace dlads {
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Helpers
-// ═══════════════════════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 namespace {
 
-// Returns the "src_ip" field from a LogEvent metadata map, or "".
-const std::string& src_ip(const LogEvent& ev) {
-    static const std::string empty;
-    auto it = ev.fields.find("src_ip");
-    return it != ev.fields.end() ? it->second : empty;
+// Case-insensitive substring search.
+bool icontains(std::string_view haystack, std::string_view needle) {
+    if (needle.empty()) return true;
+    if (needle.size() > haystack.size()) return false;
+    auto it = std::search(
+        haystack.begin(), haystack.end(),
+        needle.begin(),   needle.end(),
+        [](unsigned char a, unsigned char b){
+            return std::tolower(a) == std::tolower(b);
+        });
+    return it != haystack.end();
 }
 
-// Does the message body contain any of the given substrings?
-bool msg_contains(const LogEvent& ev, std::initializer_list<const char*> needles) {
-    for (const char* n : needles) {
-        if (ev.message.find(n) != std::string::npos) return true;
-    }
-    return false;
+// Extract "from <ip>" pattern — sshd log format.
+// Returns empty on failure.
+std::string parse_from_ip(std::string_view msg) {
+    static constexpr std::string_view FROM = "from ";
+    auto pos = msg.find(FROM);
+    if (pos == std::string_view::npos) return {};
+    std::string_view rest = msg.substr(pos + FROM.size());
+    // IP ends at first whitespace.
+    auto end = rest.find(' ');
+    if (end == std::string_view::npos) end = rest.size();
+    return std::string(rest.substr(0, end));
 }
 
-using Clock     = std::chrono::system_clock;
-using TimePoint = Clock::time_point;
-using Seconds   = std::chrono::seconds;
-
-TimePoint now_tp() { return Clock::now(); }
-
-double age_seconds(const LogEvent& ev) {
-    return std::chrono::duration<double>(now_tp() - ev.timestamp).count();
+// Extract "DPT=<port>" from iptables log lines.
+// Returns -1 on failure.
+int parse_dpt(std::string_view msg) {
+    static constexpr std::string_view DPT = "DPT=";
+    auto pos = msg.find(DPT);
+    if (pos == std::string_view::npos) return -1;
+    std::string_view rest = msg.substr(pos + DPT.size());
+    int v = -1;
+    std::from_chars(rest.data(), rest.data() + rest.size(), v);
+    return v;
 }
 
-} // anonymous namespace
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// SshBruteForceRule
-// ═══════════════════════════════════════════════════════════════════════════════
-
-SshBruteForceRule::SshBruteForceRule(int threshold, int window_seconds)
-    : threshold_(threshold), window_seconds_(window_seconds) {}
-
-std::optional<AlertEvent> SshBruteForceRule::evaluate(
-    const LogEvent&              event,
-    const std::vector<LogEvent>& recent_history)
-{
-    // Only interested in sshd failures on the current event.
-    if (event.log_source.find("sshd") == std::string::npos) return std::nullopt;
-
-    const bool is_failure = msg_contains(event, {
-        "Failed password",
-        "Invalid user",
-        "authentication failure",
-        "FAILED LOGIN"
-    });
-    if (!is_failure) return std::nullopt;
-
-    const std::string& attacker = src_ip(event);
-    if (attacker.empty()) return std::nullopt;
-
-    // Count failures from the same IP within the window.
-    int count = 0;
-    const double window = static_cast<double>(window_seconds_);
-
-    for (const auto& ev : recent_history) {
-        if (age_seconds(ev) > window)                           continue;
-        if (ev.log_source.find("sshd") == std::string::npos)   continue;
-        if (src_ip(ev) != attacker)                             continue;
-        if (!msg_contains(ev, {"Failed password", "Invalid user",
-                                "authentication failure", "FAILED LOGIN"}))
-            continue;
-        ++count;
-    }
-
-    if (count < threshold_) return std::nullopt;
-
-    AlertEvent alert;
-    alert.alert_id       = AlertEvent::next_id();
-    alert.timestamp      = now_tp();
-    alert.source_host    = event.source_host;
-    alert.rule_id        = rule_id();
-    alert.severity       = Severity::HIGH;
-    alert.anomaly_score  = std::min(1.0f, static_cast<float>(count) /
-                                          static_cast<float>(threshold_ * 3));
-    alert.description    = "SSH brute-force detected from " + attacker +
-                           " (" + std::to_string(count) + " failures in " +
-                           std::to_string(window_seconds_) + "s)";
-    alert.metadata["src_ip"]         = attacker;
-    alert.metadata["failure_count"]  = std::to_string(count);
-    alert.metadata["window_seconds"] = std::to_string(window_seconds_);
-    return alert;
+// Extract username from "for user root by <username>" (sudo log).
+std::string parse_sudo_user(std::string_view msg) {
+    static constexpr std::string_view BY = " by ";
+    auto pos = msg.rfind(BY);
+    if (pos == std::string_view::npos) return {};
+    std::string_view rest = msg.substr(pos + BY.size());
+    // Username ends at first whitespace or end-of-string.
+    auto end = rest.find_first_of(" \t(");
+    if (end == std::string_view::npos) end = rest.size();
+    return std::string(rest.substr(0, end));
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// PrivilegeEscalationRule
-// ═══════════════════════════════════════════════════════════════════════════════
-
-PrivilegeEscalationRule::PrivilegeEscalationRule(int lookback_seconds)
-    : lookback_seconds_(lookback_seconds) {}
-
-std::optional<AlertEvent> PrivilegeEscalationRule::evaluate(
-    const LogEvent&              event,
-    const std::vector<LogEvent>& recent_history)
-{
-    // Trigger on "sudo session opened".
-    if (event.log_source.find("sudo") == std::string::npos &&
-        event.message.find("sudo") == std::string::npos)
-        return std::nullopt;
-
-    if (!msg_contains(event, {"session opened", "COMMAND="})) return std::nullopt;
-
-    // Extract the user who ran sudo.
-    std::string user;
-    {
-        auto it = event.fields.find("user");
-        if (it != event.fields.end()) {
-            user = it->second;
-        } else {
-            // Fallback: scan message for "for USER by"
-            const std::string& m = event.message;
-            auto pos = m.find("for ");
-            if (pos != std::string::npos) {
-                pos += 4;
-                auto end = m.find(' ', pos);
-                user = m.substr(pos, end == std::string::npos ? end : end - pos);
-            }
-        }
-    }
-    if (user.empty()) return std::nullopt;
-
-    // Check whether this user had a prior SUCCESSFUL sudo in the lookback window.
-    const double lookback = static_cast<double>(lookback_seconds_);
-    for (const auto& ev : recent_history) {
-        if (age_seconds(ev) > lookback) continue;
-        if (ev.log_source.find("sudo") == std::string::npos &&
-            ev.message.find("sudo") == std::string::npos) continue;
-        if (!msg_contains(ev, {"session opened", "COMMAND="})) continue;
-
-        std::string ev_user;
-        auto it = ev.fields.find("user");
-        if (it != ev.fields.end()) ev_user = it->second;
-
-        if (ev_user == user) return std::nullopt; // Prior sudo found → not suspicious.
-    }
-
-    AlertEvent alert;
-    alert.alert_id      = AlertEvent::next_id();
-    alert.timestamp     = now_tp();
-    alert.source_host   = event.source_host;
-    alert.rule_id       = rule_id();
-    alert.severity      = Severity::CRITICAL;
-    alert.anomaly_score = 0.85f;
-    alert.description   = "Privilege escalation: user '" + user +
-                          "' opened sudo session with no prior sudo history";
-    alert.metadata["user"]            = user;
-    alert.metadata["lookback_seconds"]= std::to_string(lookback_seconds_);
-    return alert;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// PortScanRule
-// ═══════════════════════════════════════════════════════════════════════════════
-
-PortScanRule::PortScanRule(int distinct_port_threshold, int window_seconds)
-    : distinct_port_threshold_(distinct_port_threshold),
-      window_seconds_(window_seconds) {}
-
-std::optional<AlertEvent> PortScanRule::evaluate(
-    const LogEvent&              event,
-    const std::vector<LogEvent>& recent_history)
-{
-    // Connection-refused pattern: kernel/firewall log or "connection refused"
-    if (!msg_contains(event, {"Connection refused", "connection refused",
-                               "REJECT", "DPT=", "refused connect"}))
-        return std::nullopt;
-
-    const std::string& attacker = src_ip(event);
-    if (attacker.empty()) return std::nullopt;
-
-    std::set<std::string> distinct_ports;
-    const double window = static_cast<double>(window_seconds_);
-
-    auto collect_port = [&](const LogEvent& ev) {
-        auto it = ev.fields.find("dst_port");
-        if (it == ev.fields.end()) it = ev.fields.find("port");
-        if (it != ev.fields.end() && !it->second.empty())
-            distinct_ports.insert(it->second);
-    };
-
-    for (const auto& ev : recent_history) {
-        if (age_seconds(ev) > window) continue;
-        if (src_ip(ev) != attacker)   continue;
-        if (!msg_contains(ev, {"Connection refused", "connection refused",
-                                "REJECT", "DPT=", "refused connect"})) continue;
-        collect_port(ev);
-    }
-    collect_port(event);
-
-    if (static_cast<int>(distinct_ports.size()) < distinct_port_threshold_)
-        return std::nullopt;
-
-    AlertEvent alert;
-    alert.alert_id      = AlertEvent::next_id();
-    alert.timestamp     = now_tp();
-    alert.source_host   = event.source_host;
-    alert.rule_id       = rule_id();
-    alert.severity      = Severity::HIGH;
-    alert.anomaly_score = std::min(1.0f,
-        static_cast<float>(distinct_ports.size()) /
-        static_cast<float>(distinct_port_threshold_ * 2));
-    alert.description   = "Port scan detected from " + attacker +
-                          " (" + std::to_string(distinct_ports.size()) +
-                          " distinct ports in " +
-                          std::to_string(window_seconds_) + "s)";
-    alert.metadata["src_ip"]              = attacker;
-    alert.metadata["distinct_port_count"] = std::to_string(distinct_ports.size());
-    alert.metadata["window_seconds"]      = std::to_string(window_seconds_);
-    return alert;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// RuleEngine — config loader
-// ═══════════════════════════════════════════════════════════════════════════════
-
-RuleEngine::ThresholdConfig RuleEngine::load_config(const std::string& path) {
-    ThresholdConfig cfg;
-    if (path.empty()) return cfg;
-
+// Lightweight YAML key=value parser (handles "  key: value" lines only).
+std::unordered_map<std::string, std::string> parse_flat_yaml(
+        const std::string& path) {
+    std::unordered_map<std::string, std::string> out;
     std::ifstream f(path);
-    if (!f.is_open()) {
-        // File missing → silently use defaults.
-        return cfg;
-    }
-
-    // Minimal INI parser: key = value  (# comments, blank lines ignored).
+    if (!f.is_open()) return out;
     std::string line;
     while (std::getline(f, line)) {
-        if (line.empty() || line[0] == '#' || line[0] == '[') continue;
-        auto eq = line.find('=');
-        if (eq == std::string::npos) continue;
-        std::string key   = line.substr(0, eq);
-        std::string value = line.substr(eq + 1);
-
-        // Trim whitespace.
+        // Strip comments.
+        auto hash = line.find('#');
+        if (hash != std::string::npos) line.resize(hash);
+        auto colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string key = line.substr(0, colon);
+        std::string val = line.substr(colon + 1);
+        // Trim whitespace from both.
         auto trim = [](std::string& s) {
-            s.erase(0, s.find_first_not_of(" \t\r\n"));
-            s.erase(s.find_last_not_of(" \t\r\n") + 1);
+            auto b = s.find_first_not_of(" \t");
+            auto e = s.find_last_not_of(" \t\r\n");
+            s = (b == std::string::npos) ? "" : s.substr(b, e - b + 1);
         };
-        trim(key); trim(value);
-
-        try {
-            int v = std::stoi(value);
-            if      (key == "ssh_threshold")    cfg.ssh_threshold   = v;
-            else if (key == "ssh_window_s")     cfg.ssh_window_s    = v;
-            else if (key == "priv_lookback_s")  cfg.priv_lookback_s = v;
-            else if (key == "port_threshold")   cfg.port_threshold  = v;
-            else if (key == "port_window_s")    cfg.port_window_s   = v;
-            else if (key == "cooldown_s")       cfg.cooldown_s      = v;
-        } catch (...) { /* malformed value — skip */ }
+        trim(key); trim(val);
+        if (!key.empty()) out[key] = val;
     }
-    return cfg;
+    return out;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// RuleEngine — construction & rule management
-// ═══════════════════════════════════════════════════════════════════════════════
+int to_int(const std::unordered_map<std::string,std::string>& m,
+           const std::string& key, int def) {
+    auto it = m.find(key);
+    if (it == m.end()) return def;
+    int v = def;
+    std::from_chars(it->second.data(),
+                    it->second.data() + it->second.size(), v);
+    return v;
+}
 
-RuleEngine::RuleEngine(const std::string& config_path, int cooldown_seconds)
-    : cfg_(load_config(config_path)),
-      cooldown_seconds_(config_path.empty() ? cooldown_seconds : cfg_.cooldown_s)
+}  // anonymous namespace
+
+// ─────────────────────────────────────────────────────────────────────────────
+// extract_src_ip  (free helper, also used by tests)
+// ─────────────────────────────────────────────────────────────────────────────
+
+std::string extract_src_ip(const LogEvent& ev) {
+    // 1. Explicit field wins.
+    if (auto it = ev.fields.find("src_ip"); it != ev.fields.end())
+        return it->second;
+    if (auto it = ev.fields.find("client"); it != ev.fields.end())
+        return it->second;
+    // 2. Try "from <ip>" pattern in the message.
+    return parse_from_ip(ev.message);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RuleConfig
+// ─────────────────────────────────────────────────────────────────────────────
+
+RuleConfig RuleConfig::from_yaml(const std::string& path) {
+    auto m = parse_flat_yaml(path);
+    RuleConfig c;
+    c.ssh_window_seconds    = to_int(m, "window_seconds",    c.ssh_window_seconds);
+    c.ssh_threshold         = to_int(m, "threshold",         c.ssh_threshold);
+    c.ssh_cooldown_seconds  = to_int(m, "cooldown_seconds",  c.ssh_cooldown_seconds);
+    c.scan_window_seconds   = to_int(m, "scan_window_seconds",  c.scan_window_seconds);
+    c.scan_threshold        = to_int(m, "scan_threshold",       c.scan_threshold);
+    c.scan_cooldown_seconds = to_int(m, "scan_cooldown_seconds",c.scan_cooldown_seconds);
+    c.priv_history_hours    = to_int(m, "priv_history_hours",   c.priv_history_hours);
+    c.priv_cooldown_seconds = to_int(m, "priv_cooldown_seconds",c.priv_cooldown_seconds);
+    c.multi_window_seconds  = to_int(m, "multi_window_seconds", c.multi_window_seconds);
+    c.multi_min_services    = to_int(m, "multi_min_services",   c.multi_min_services);
+    c.multi_cooldown_seconds= to_int(m, "multi_cooldown_seconds",c.multi_cooldown_seconds);
+    return c;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rule 1 — SSH Brute Force
+// ─────────────────────────────────────────────────────────────────────────────
+
+class SshBruteForceRule final : public Rule {
+public:
+    std::string_view rule_id() const override { return "SSH_BRUTE_FORCE_001"; }
+
+    std::chrono::seconds cooldown(const RuleConfig& cfg) const override {
+        return std::chrono::seconds(cfg.ssh_cooldown_seconds);
+    }
+
+    std::optional<AlertEvent> evaluate(
+            const LogEvent&              event,
+            const std::vector<LogEvent>& /*snapshot*/,
+            const EventIndex&            index,
+            const RuleConfig&            cfg) override
+    {
+        // Only care about sshd events with failed-login messages.
+        if (event.log_source != "sshd") return std::nullopt;
+        if (!icontains(event.message, "Failed password") &&
+            !icontains(event.message, "Invalid user"))
+            return std::nullopt;
+
+        std::string src_ip = extract_src_ip(event);
+        if (src_ip.empty()) return std::nullopt;
+
+        // Count failed logins from this IP within the window.
+        auto window = std::chrono::seconds(cfg.ssh_window_seconds);
+        auto cutoff = event.timestamp - window;
+
+        auto it = index.by_ip.find(src_ip);
+        if (it == index.by_ip.end()) return std::nullopt;
+
+        int count = 0;
+        for (const LogEvent* ev : it->second) {
+            if (ev->log_source != "sshd")            continue;
+            if (ev->timestamp < cutoff)               continue;
+            if (!icontains(ev->message, "Failed password") &&
+                !icontains(ev->message, "Invalid user")) continue;
+            ++count;
+        }
+
+        if (count < cfg.ssh_threshold) return std::nullopt;
+
+        AlertEvent alert;
+        alert.alert_id    = AlertEvent::next_id();
+        alert.timestamp   = event.timestamp;
+        alert.source_host = event.source_host;
+        alert.rule_id     = std::string(rule_id());
+        alert.severity    = Severity::HIGH;
+        alert.anomaly_score = std::min(1.0f,
+            static_cast<float>(count) / static_cast<float>(cfg.ssh_threshold * 2));
+        alert.description = "SSH brute force: " + std::to_string(count) +
+                            " failed logins from " + src_ip +
+                            " in " + std::to_string(cfg.ssh_window_seconds) + "s";
+        alert.metadata["src_ip"]        = src_ip;
+        alert.metadata["attempt_count"] = std::to_string(count);
+        return alert;
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rule 2 — Port Scan
+// ─────────────────────────────────────────────────────────────────────────────
+
+class PortScanRule final : public Rule {
+public:
+    std::string_view rule_id() const override { return "PORT_SCAN_001"; }
+
+    std::chrono::seconds cooldown(const RuleConfig& cfg) const override {
+        return std::chrono::seconds(cfg.scan_cooldown_seconds);
+    }
+
+    std::optional<AlertEvent> evaluate(
+            const LogEvent&              event,
+            const std::vector<LogEvent>& /*snapshot*/,
+            const EventIndex&            index,
+            const RuleConfig&            cfg) override
+    {
+        // Look for iptables REJECT or connection-refused events.
+        bool is_reject = (event.log_source == "kernel" &&
+                          (icontains(event.message, "REJECT") ||
+                           icontains(event.message, "DPT=")));
+        bool is_refused = icontains(event.message, "Connection refused") ||
+                          icontains(event.message, "connection refused");
+        if (!is_reject && !is_refused) return std::nullopt;
+
+        std::string src_ip = extract_src_ip(event);
+        // For iptables lines, SRC= field may be used instead.
+        if (src_ip.empty()) {
+            if (auto it = event.fields.find("src"); it != event.fields.end())
+                src_ip = it->second;
+        }
+        if (src_ip.empty()) return std::nullopt;
+
+        auto window = std::chrono::seconds(cfg.scan_window_seconds);
+        auto cutoff = event.timestamp - window;
+
+        // Count distinct destination ports from this IP in the window.
+        std::set<int> ports_seen;
+        auto it = index.by_ip.find(src_ip);
+        if (it != index.by_ip.end()) {
+            for (const LogEvent* ev : it->second) {
+                if (ev->timestamp < cutoff) continue;
+                int dpt = parse_dpt(ev->message);
+                if (dpt > 0) ports_seen.insert(dpt);
+            }
+        }
+        // Also check by_source for connection-refused entries.
+        for (const LogEvent* ev : index.last_60s) {
+            if (ev->timestamp < cutoff)    continue;
+            if (extract_src_ip(*ev) != src_ip) continue;
+            if (!icontains(ev->message, "refused")) continue;
+            int dpt = parse_dpt(ev->message);
+            if (dpt > 0) ports_seen.insert(dpt);
+        }
+
+        int distinct = static_cast<int>(ports_seen.size());
+        if (distinct < cfg.scan_threshold) return std::nullopt;
+
+        AlertEvent alert;
+        alert.alert_id    = AlertEvent::next_id();
+        alert.timestamp   = event.timestamp;
+        alert.source_host = event.source_host;
+        alert.rule_id     = std::string(rule_id());
+        alert.severity    = Severity::HIGH;
+        alert.anomaly_score = std::min(1.0f,
+            static_cast<float>(distinct) / 50.0f);
+        alert.description = "Port scan: " + src_ip + " hit " +
+                            std::to_string(distinct) + " distinct ports in " +
+                            std::to_string(cfg.scan_window_seconds) + "s";
+        alert.metadata["src_ip"]       = src_ip;
+        alert.metadata["port_count"]   = std::to_string(distinct);
+        return alert;
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rule 3 — Privilege Escalation
+// ─────────────────────────────────────────────────────────────────────────────
+
+class PrivEscRule final : public Rule {
+public:
+    std::string_view rule_id() const override { return "PRIV_ESC_001"; }
+
+    std::chrono::seconds cooldown(const RuleConfig& cfg) const override {
+        return std::chrono::seconds(cfg.priv_cooldown_seconds);
+    }
+
+    std::optional<AlertEvent> evaluate(
+            const LogEvent&              event,
+            const std::vector<LogEvent>& /*snapshot*/,
+            const EventIndex&            index,
+            const RuleConfig&            cfg) override
+    {
+        // Only sudo session-opened events.
+        if (event.log_source != "sudo") return std::nullopt;
+        if (!icontains(event.message, "session opened")) return std::nullopt;
+
+        std::string username = parse_sudo_user(event.message);
+        if (username.empty()) return std::nullopt;
+
+        // Scan history: has this user done a sudo before?
+        auto window  = std::chrono::hours(cfg.priv_history_hours);
+        auto cutoff  = event.timestamp - window;
+
+        bool seen_before = false;
+        auto sit = index.by_source.find("sudo");
+        if (sit != index.by_source.end()) {
+            for (const LogEvent* ev : sit->second) {
+                if (ev == &event)              continue;  // skip self
+                if (ev->timestamp < cutoff)    continue;
+                if (!icontains(ev->message, username)) continue;
+                // Any prior sudo event for this user counts.
+                seen_before = true;
+                break;
+            }
+        }
+
+        if (seen_before) return std::nullopt;
+
+        AlertEvent alert;
+        alert.alert_id    = AlertEvent::next_id();
+        alert.timestamp   = event.timestamp;
+        alert.source_host = event.source_host;
+        alert.rule_id     = std::string(rule_id());
+        alert.severity    = Severity::CRITICAL;
+        alert.anomaly_score = 0.9f;
+        alert.description = "Privilege escalation: first-time sudo session "
+                            "opened by user '" + username + "'";
+        alert.metadata["username"] = username;
+        return alert;
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rule 4 — Multi-Service Auth Failure
+// ─────────────────────────────────────────────────────────────────────────────
+
+class MultiServiceAuthRule final : public Rule {
+public:
+    std::string_view rule_id() const override { return "MULTI_SERVICE_AUTH_001"; }
+
+    std::chrono::seconds cooldown(const RuleConfig& cfg) const override {
+        return std::chrono::seconds(cfg.multi_cooldown_seconds);
+    }
+
+    std::optional<AlertEvent> evaluate(
+            const LogEvent&              event,
+            const std::vector<LogEvent>& /*snapshot*/,
+            const EventIndex&            index,
+            const RuleConfig&            cfg) override
+    {
+        // Must be an auth failure event.
+        bool is_fail = icontains(event.message, "authentication failure") ||
+                       icontains(event.message, "Failed password")        ||
+                       icontains(event.message, "auth error")             ||
+                       icontains(event.message, "Invalid user");
+        if (!is_fail) return std::nullopt;
+
+        std::string src_ip = extract_src_ip(event);
+        if (src_ip.empty()) return std::nullopt;
+
+        auto window = std::chrono::seconds(cfg.multi_window_seconds);
+        auto cutoff = event.timestamp - window;
+
+        // Count distinct services this IP has failed auth on.
+        std::set<std::string> services_hit;
+        // Include the current event's service.
+        if (!event.log_source.empty()) services_hit.insert(event.log_source);
+
+        auto it = index.by_ip.find(src_ip);
+        if (it != index.by_ip.end()) {
+            for (const LogEvent* ev : it->second) {
+                if (ev->timestamp < cutoff) continue;
+                bool fail = icontains(ev->message, "authentication failure") ||
+                            icontains(ev->message, "Failed password")        ||
+                            icontains(ev->message, "auth error")             ||
+                            icontains(ev->message, "Invalid user");
+                if (!fail) continue;
+                if (!ev->log_source.empty())
+                    services_hit.insert(ev->log_source);
+            }
+        }
+
+        int distinct = static_cast<int>(services_hit.size());
+        if (distinct < cfg.multi_min_services) return std::nullopt;
+
+        // Build a comma-separated service list for the alert.
+        std::string svc_list;
+        for (const auto& s : services_hit) {
+            if (!svc_list.empty()) svc_list += ',';
+            svc_list += s;
+        }
+
+        AlertEvent alert;
+        alert.alert_id    = AlertEvent::next_id();
+        alert.timestamp   = event.timestamp;
+        alert.source_host = event.source_host;
+        alert.rule_id     = std::string(rule_id());
+        alert.severity    = Severity::CRITICAL;
+        alert.anomaly_score = std::min(1.0f,
+            static_cast<float>(distinct) / 4.0f);
+        alert.description = "Multi-service auth failure: " + src_ip +
+                            " failed on services [" + svc_list + "]";
+        alert.metadata["src_ip"]   = src_ip;
+        alert.metadata["services"] = svc_list;
+        alert.metadata["service_count"] = std::to_string(distinct);
+        return alert;
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RuleEngine
+// ─────────────────────────────────────────────────────────────────────────────
+
+RuleEngine::RuleEngine(RuleConfig cfg)
+    : cfg_(std::move(cfg))
 {
-    // Register built-in rules with config-loaded thresholds.
-    rules_.push_back(std::make_unique<SshBruteForceRule>(
-        cfg_.ssh_threshold, cfg_.ssh_window_s));
-    rules_.push_back(std::make_unique<PrivilegeEscalationRule>(
-        cfg_.priv_lookback_s));
-    rules_.push_back(std::make_unique<PortScanRule>(
-        cfg_.port_threshold, cfg_.port_window_s));
+    rules_.push_back(std::make_unique<SshBruteForceRule>());
+    rules_.push_back(std::make_unique<PortScanRule>());
+    rules_.push_back(std::make_unique<PrivEscRule>());
+    rules_.push_back(std::make_unique<MultiServiceAuthRule>());
 }
 
-void RuleEngine::add_rule(std::unique_ptr<Rule> rule) {
-    rules_.push_back(std::move(rule));
+void RuleEngine::set_config(RuleConfig cfg) {
+    cfg_ = std::move(cfg);
 }
 
-void RuleEngine::reset_dedup() {
-    dedup_table_.clear();
-}
+// ── Index building ────────────────────────────────────────────────────────────
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// RuleEngine — deduplication
-// ═══════════════════════════════════════════════════════════════════════════════
-
-bool RuleEngine::is_suppressed(const std::string& rid,
-                                const std::string& source_ip)
+EventIndex RuleEngine::build_index(
+        const std::vector<LogEvent>& snapshot,
+        std::chrono::system_clock::time_point now)
 {
-    std::string key = rid + "|" + source_ip;
-    auto it = dedup_table_.find(key);
-    if (it == dedup_table_.end()) return false;
-    auto elapsed = std::chrono::duration_cast<Seconds>(now_tp() - it->second).count();
-    return elapsed < cooldown_seconds_;
+    EventIndex idx;
+    auto cutoff_60s  = now - std::chrono::seconds(60);
+    auto cutoff_300s = now - std::chrono::seconds(300);
+
+    for (const LogEvent& ev : snapshot) {
+        // IP index.
+        std::string ip = extract_src_ip(ev);
+        idx.by_ip[ip].push_back(&ev);
+
+        // Source index.
+        idx.by_source[ev.log_source].push_back(&ev);
+
+        // Time-filtered views.
+        if (ev.timestamp >= cutoff_300s) {
+            idx.last_300s.push_back(&ev);
+            if (ev.timestamp >= cutoff_60s)
+                idx.last_60s.push_back(&ev);
+        }
+    }
+    return idx;
 }
 
-void RuleEngine::record_firing(const std::string& rid,
-                                const std::string& source_ip)
-{
-    dedup_table_[rid + "|" + source_ip] = now_tp();
+// ── Cooldown helpers ──────────────────────────────────────────────────────────
+
+bool RuleEngine::in_cooldown(const std::string& key) const {
+    auto it = cooldown_map_.find(key);
+    if (it == cooldown_map_.end()) return false;
+    return std::chrono::system_clock::now() < it->second;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// RuleEngine — main evaluation loop
-// ═══════════════════════════════════════════════════════════════════════════════
+void RuleEngine::set_cooldown(const std::string& key,
+                              std::chrono::seconds duration) {
+    cooldown_map_[key] = std::chrono::system_clock::now() + duration;
+}
+
+// ── process ───────────────────────────────────────────────────────────────────
 
 std::vector<AlertEvent> RuleEngine::process(
-    const LogEvent&              event,
-    const std::vector<LogEvent>& recent_history)
+        const LogEvent&              event,
+        const std::vector<LogEvent>& snapshot)
 {
+    auto now = std::chrono::system_clock::now();
+    EventIndex index = build_index(snapshot, now);
+
     std::vector<AlertEvent> results;
 
     for (auto& rule : rules_) {
-        auto maybe = rule->evaluate(event, recent_history);
+        auto maybe = rule->evaluate(event, snapshot, index, cfg_);
         if (!maybe) continue;
 
-        // Determine source IP for dedup key.
-        std::string ip;
-        auto it = maybe->metadata.find("src_ip");
-        if (it != maybe->metadata.end()) ip = it->second;
-        else {
-            auto it2 = event.fields.find("src_ip");
-            if (it2 != event.fields.end()) ip = it2->second;
-            else ip = event.source_host;
-        }
+        // Build the dedup key: "RULE_ID:src_ip"
+        std::string src_ip = maybe->metadata.count("src_ip")
+                             ? maybe->metadata.at("src_ip")
+                             : maybe->source_host;
+        std::string dedup_key = std::string(rule->rule_id()) + ":" + src_ip;
 
-        if (is_suppressed(rule->rule_id(), ip)) continue;
+        if (in_cooldown(dedup_key)) continue;
 
-        record_firing(rule->rule_id(), ip);
+        set_cooldown(dedup_key, rule->cooldown(cfg_));
         results.push_back(std::move(*maybe));
     }
 
