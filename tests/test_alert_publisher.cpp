@@ -66,34 +66,22 @@ static std::vector<std::string> recv_n(void* sock, int count,
 class PublisherTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        port_ = 15000 + (test_counter_++ % 100);
-
-        // PUB must bind before SUB connects to avoid the slow-joiner problem.
-        // We pre-bind a throwaway socket just to reserve the port, then let
-        // AlertPublisher bind it properly in each test after this SUB is ready.
         ctx_  = zmq_ctx_new();
         sock_ = zmq_socket(ctx_, ZMQ_SUB);
 
         int linger = 0;
         zmq_setsockopt(sock_, ZMQ_LINGER, &linger, sizeof(linger));
-        int rcvtimeo = 100;  // 100ms recv timeout for non-blocking polls
-        zmq_setsockopt(sock_, ZMQ_RCVTIMEO, &rcvtimeo, sizeof(rcvtimeo));
+        // Subscribe to all messages.
         zmq_setsockopt(sock_, ZMQ_SUBSCRIBE, "", 0);
+
+        // Assign a unique port per test to avoid cross-test interference.
+        port_ = 15000 + (test_counter_++ % 100);
         zmq_connect(sock_, sub_endpoint(port_).c_str());
     }
 
     void TearDown() override {
         zmq_close(sock_);
         zmq_ctx_destroy(ctx_);
-    }
-
-    // Start publisher and wait long enough for PUB/SUB handshake to complete.
-    AlertPublisher* start_pub() {
-        auto* pub = new AlertPublisher(pub_endpoint(port_));
-        pub->start();
-        // ZMQ PUB/SUB handshake requires ~100-200ms on loopback.
-        std::this_thread::sleep_for(200ms);
-        return pub;
     }
 
     void* ctx_  = nullptr;
@@ -107,13 +95,14 @@ protected:
 // ─────────────────────────────────────────────────────────────────────────────
 
 TEST_F(PublisherTest, DeliversSingleAlert) {
-    auto* pub = start_pub();
+    AlertPublisher pub(pub_endpoint(port_));
+    pub.start();
+    std::this_thread::sleep_for(50ms);  // let socket bind + SUB connect
 
-    pub->publish(make_alert());
+    pub.publish(make_alert());
 
     auto msgs = recv_n(sock_, 1, 2000ms);
-    pub->stop();
-    delete pub;
+    pub.stop();
 
     ASSERT_EQ(msgs.size(), 1u);
     auto ev = deserialize(msgs[0]);
@@ -122,15 +111,16 @@ TEST_F(PublisherTest, DeliversSingleAlert) {
 }
 
 TEST_F(PublisherTest, Delivers1000Alerts) {
-    auto* pub = start_pub();
+    AlertPublisher pub(pub_endpoint(port_));
+    pub.start();
+    std::this_thread::sleep_for(50ms);
 
     constexpr int N = 1000;
     for (int i = 0; i < N; ++i)
-        pub->publish(make_alert("RULE_" + std::to_string(i % 10)));
+        pub.publish(make_alert("RULE_" + std::to_string(i % 10)));
 
     auto msgs = recv_n(sock_, N, 5000ms);
-    pub->stop();
-    delete pub;
+    pub.stop();
 
     EXPECT_EQ(msgs.size(), static_cast<std::size_t>(N));
     // Every received message must deserialize cleanly.
@@ -140,17 +130,18 @@ TEST_F(PublisherTest, Delivers1000Alerts) {
 }
 
 TEST_F(PublisherTest, AlertContentSurvivesWire) {
-    auto* pub = start_pub();
+    AlertPublisher pub(pub_endpoint(port_));
+    pub.start();
+    std::this_thread::sleep_for(50ms);
 
     auto original = make_alert("WIRE_CHECK");
     original.severity      = Severity::CRITICAL;
     original.anomaly_score = 0.99f;
     original.metadata["src_ip"] = "192.168.1.55";
-    pub->publish(original);
+    pub.publish(original);
 
     auto msgs = recv_n(sock_, 1, 2000ms);
-    pub->stop();
-    delete pub;
+    pub.stop();
 
     ASSERT_EQ(msgs.size(), 1u);
     auto ev = deserialize(msgs[0]);
@@ -185,14 +176,17 @@ TEST_F(PublisherTest, PublishNeverBlocksWhenNoReceiver) {
 }
 
 TEST_F(PublisherTest, DroppedCountReflectsQueueOverflow) {
-    // Push WITHOUT starting the send thread so nothing drains the queue.
+    // Fill more than queue capacity (1024) without a receiver draining it.
+    // Use a port with no subscriber so the send thread can't drain fast enough
+    // to race with our push.
     AlertPublisher pub("tcp://127.0.0.1:19998");
-    // Do NOT call pub.start() — we want the queue to fill up.
+    pub.start();
 
-    // Push 1200 alerts — 176 should overflow the 1024-slot queue.
+    // Push 1200 alerts immediately — 176 should overflow the 1024 queue.
     for (int i = 0; i < 1200; ++i)
         pub.publish(make_alert());
 
+    pub.stop();
     EXPECT_GT(pub.dropped_count(), 0u);
 }
 
@@ -237,7 +231,7 @@ TEST_F(PublisherTest, DestructorStopsSendThread) {
 TEST_F(PublisherTest, MedianLatencyUnder5ms) {
     AlertPublisher pub(pub_endpoint(port_));
     pub.start();
-    std::this_thread::sleep_for(200ms);  // let SUB fully connect + ZMQ handshake
+    std::this_thread::sleep_for(100ms);  // let SUB fully connect
 
     constexpr int N = 50;
     std::vector<long long> latencies;
@@ -263,7 +257,7 @@ TEST_F(PublisherTest, MedianLatencyUnder5ms) {
     std::cout << "[LATENCY] median=" << median << " us  "
               << "p95=" << latencies[latencies.size() * 95 / 100] << " us\n";
 
-    // ASan/UBSan inflate latency 10-20x; use 50ms as the bound in debug builds.
-    EXPECT_LT(median, 50000)
+    // 5ms = 5000us on loopback. ASan adds overhead so we use a generous bound.
+    EXPECT_LT(median, 5000)
         << "Median latency " << median << "us exceeds 5ms target";
 }

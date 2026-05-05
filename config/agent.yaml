@@ -7,3 +7,8 @@ agent:
 # tailer:
 #   watch_path: "/var/log/auth.log"
 #   poll_interval_ms: 100
+
+publisher:
+  endpoint: "tcp://*:5555"
+  queue_capacity: 1024
+  drop_warn_threshold_pct: 1
