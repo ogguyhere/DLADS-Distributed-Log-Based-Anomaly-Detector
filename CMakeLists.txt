@@ -62,7 +62,39 @@ target_link_libraries(dlads_core PUBLIC
 add_executable(dlads_agent src/agent_main.cpp)
 target_link_libraries(dlads_agent PRIVATE dlads_core)
 
+<<<<<<< Updated upstream
 # ── Tests ─────────────────────────────────────────────────────────────────────
+=======
+# ─────────────────────────────────────────────
+# Subscriber binary
+# ─────────────────────────────────────────────
+add_executable(dlads_subscriber src/subscriber.cpp)
+
+target_link_libraries(dlads_subscriber PRIVATE dlads_core ${ZMQ_LIBRARIES} cppzmq)
+
+
+# ─────────────────────────────────────────────
+# SQLite 
+# ─────────────────────────────────────────────
+
+find_package(SQLite3 REQUIRED)
+
+# Coordinator binary (Person B - Final I)
+add_executable(dlads_coordinator src/coordinator.cpp)
+target_include_directories(dlads_coordinator PRIVATE include)
+target_link_libraries(dlads_coordinator PRIVATE
+  dlads_core
+  ${ZMQ_LIBRARIES}
+  cppzmq
+  SQLite3::SQLite3
+  Threads::Threads
+)
+
+
+# ─────────────────────────────────────────────
+# Tests
+# ─────────────────────────────────────────────
+>>>>>>> Stashed changes
 enable_testing()
 
 add_executable(test_ring_buffer tests/test_ring_buffer.cpp)
