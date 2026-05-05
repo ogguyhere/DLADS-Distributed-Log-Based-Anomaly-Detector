@@ -90,7 +90,19 @@ target_link_libraries(dlads_coordinator PRIVATE
   SQLite3::SQLite3
   Threads::Threads
 )
-
+# ─────────────────────────────────────────────
+# Dashboard
+# ─────────────────────────────────────────────
+# Dashboard binary (Person B - Final II)
+find_package(CURL REQUIRED)
+add_executable(dlads_dashboard src/dashboard.cpp)
+target_include_directories(dlads_dashboard PRIVATE include)
+target_link_libraries(dlads_dashboard PRIVATE
+  nlohmann_json::nlohmann_json
+  CURL::libcurl
+  ncurses
+  Threads::Threads
+)
 
 # ─────────────────────────────────────────────
 # Tests
