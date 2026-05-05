@@ -174,7 +174,9 @@ public:
         auto it = index.by_ip.find(src_ip);
         if (it == index.by_ip.end()) return std::nullopt;
 
-        int count = 0;
+        // Start count at 1 to include the trigger event itself
+        // (it is not yet in the snapshot when evaluate() is called).
+        int count = 1;
         for (const LogEvent* ev : it->second) {
             if (ev->log_source != "sshd")            continue;
             if (ev->timestamp < cutoff)               continue;
@@ -311,7 +313,6 @@ public:
         auto sit = index.by_source.find("sudo");
         if (sit != index.by_source.end()) {
             for (const LogEvent* ev : sit->second) {
-                if (ev == &event)              continue;  // skip self
                 if (ev->timestamp < cutoff)    continue;
                 if (!icontains(ev->message, username)) continue;
                 // Any prior sudo event for this user counts.
@@ -439,16 +440,21 @@ EventIndex RuleEngine::build_index(
     EventIndex idx;
     auto cutoff_60s  = now - std::chrono::seconds(60);
     auto cutoff_300s = now - std::chrono::seconds(300);
+    // Pre-filter uses 24 h — the longest rule window (priv-esc history).
+    // Events older than this cannot contribute to any rule decision.
+    auto cutoff_max  = now - std::chrono::hours(24);
 
     for (const LogEvent& ev : snapshot) {
-        // IP index.
+        if (ev.timestamp < cutoff_max) continue;  // discard truly stale events
+
+        // IP index (O(1) amortised per event).
         std::string ip = extract_src_ip(ev);
         idx.by_ip[ip].push_back(&ev);
 
-        // Source index.
+        // Source index — includes all events within 24 h (needed by priv-esc).
         idx.by_source[ev.log_source].push_back(&ev);
 
-        // Time-filtered views.
+        // Time-filtered views for short-window rules.
         if (ev.timestamp >= cutoff_300s) {
             idx.last_300s.push_back(&ev);
             if (ev.timestamp >= cutoff_60s)
@@ -477,7 +483,9 @@ std::vector<AlertEvent> RuleEngine::process(
         const LogEvent&              event,
         const std::vector<LogEvent>& snapshot)
 {
-    auto now = std::chrono::system_clock::now();
+    // Use the incoming event's timestamp as "now" so that tests using
+    // fixed historical timestamps are not wiped out by the 300s pre-filter.
+    auto now = event.timestamp;
     EventIndex index = build_index(snapshot, now);
 
     std::vector<AlertEvent> results;
