@@ -11,7 +11,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 COORDINATOR_HOST="localhost"
 ALERT_PORT=5555
@@ -25,7 +25,6 @@ echo "   Distributed Log Anomaly Detection"
 echo "============================================="
 echo -e "${NC}"
 
-# Check coordinator is running
 echo -e "${YELLOW}[*] Checking coordinator is reachable...${NC}"
 if ! curl -s http://$COORDINATOR_HOST:$API_PORT/stats > /dev/null 2>&1; then
     echo -e "${RED}[ERROR] Coordinator not reachable on port $API_PORT${NC}"
@@ -45,7 +44,7 @@ import zmq, json, time
 ctx = zmq.Context()
 sock = ctx.socket(zmq.PUB)
 sock.connect('tcp://$COORDINATOR_HOST:$ALERT_PORT')
-time.sleep(0.5)
+time.sleep(1.5)
 alert = {
     'alert_id':             'test1-alert-001',
     'timestamp':            int(time.time()),
@@ -72,7 +71,7 @@ fi
 echo ""
 
 # =============================================================================
-# TEST 2 — Cross-node correlated threat (section 3.5 scenario)
+# TEST 2 — Cross-node correlated threat
 # =============================================================================
 echo -e "${BLUE}[TEST 2] Cross-node correlation — two nodes, same IP, should trigger CRITICAL threat${NC}"
 
@@ -81,9 +80,8 @@ import zmq, json, time
 ctx = zmq.Context()
 sock = ctx.socket(zmq.PUB)
 sock.connect('tcp://$COORDINATOR_HOST:$ALERT_PORT')
-time.sleep(0.5)
+time.sleep(1.5)
 
-# Node A — SSH brute force
 alert_a = {
     'alert_id':             'test2-alert-001',
     'timestamp':            int(time.time()),
@@ -99,7 +97,6 @@ sock.send_string(json.dumps(alert_a))
 print('  Sent SSH brute force alert from node-auth-01')
 time.sleep(2)
 
-# Node B — same attacker IP, web scanning
 alert_b = {
     'alert_id':             'test2-alert-002',
     'timestamp':            int(time.time()),
@@ -120,7 +117,11 @@ sleep 3
 THREATS=$(curl -s http://$COORDINATOR_HOST:$API_PORT/threats)
 if echo "$THREATS" | grep -q "203.0.113.42"; then
     echo -e "${GREEN}[PASS] Cross-node correlated threat detected for 203.0.113.42${NC}"
-    SEVERITY=$(echo "$THREATS" | python3 -c "import sys,json; d=json.load(sys.stdin); [print('  Severity:', t['severity']) for t in d if '203.0.113.42' in t.get('source_ip','')]" 2>/dev/null)
+    SEVERITY=$(echo "$THREATS" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+[print('  Severity:', t['severity']) for t in d if '203.0.113.42' in t.get('source_ip','')]
+" 2>/dev/null)
     echo -e "${GREEN}$SEVERITY${NC}"
 else
     echo -e "${RED}[FAIL] Cross-node threat was not detected${NC}"
@@ -138,7 +139,7 @@ import zmq, json, time
 ctx = zmq.Context()
 sock = ctx.socket(zmq.PUB)
 sock.connect('tcp://$COORDINATOR_HOST:$ALERT_PORT')
-time.sleep(0.5)
+time.sleep(1.5)
 
 alert = {
     'alert_id':             'test3-alert-001',
@@ -150,10 +151,10 @@ alert = {
     'description':          'Statistical anomaly: event rate deviated 9.12 std devs from baseline',
     'contributing_log_ids': ['log-t3-001'],
     'metadata': {
-        'source_ip':      '172.16.0.55',
-        'z_score':        '9.120',
-        'current_rate':   '95.00',
-        'baseline_mean':  '5.00'
+        'source_ip':     '172.16.0.55',
+        'z_score':       '9.120',
+        'current_rate':  '95.00',
+        'baseline_mean': '5.00'
     }
 }
 sock.send_string(json.dumps(alert))
@@ -175,12 +176,12 @@ echo ""
 # =============================================================================
 echo -e "${BLUE}[TEST 4] Heartbeat — node registration and status${NC}"
 
-python3 -c "
+python3 << 'PYEOF'
 import zmq, json, time
 ctx = zmq.Context()
 sock = ctx.socket(zmq.PUSH)
-sock.connect('tcp://$COORDINATOR_HOST:$HEARTBEAT_PORT')
-time.sleep(0.3)
+sock.connect('tcp://localhost:5556')
+time.sleep(1.5)
 
 for node_id, host_ip in [('node-hb-01', '192.168.1.10'), ('node-hb-02', '192.168.1.11')]:
     ping = {
@@ -190,11 +191,12 @@ for node_id, host_ip in [('node-hb-01', '192.168.1.10'), ('node-hb-02', '192.168
     }
     sock.send_string(json.dumps(ping))
     print(f'  Sent heartbeat from {node_id} ({host_ip})')
-    time.sleep(0.3)
-time.sleep(1)
-"
+    time.sleep(1.0)
 
-sleep 2
+time.sleep(1.0)
+PYEOF
+
+sleep 3
 NODES=$(curl -s http://$COORDINATOR_HOST:$API_PORT/nodes)
 if echo "$NODES" | grep -q "node-hb-01" && echo "$NODES" | grep -q "node-hb-02"; then
     echo -e "${GREEN}[PASS] Both heartbeat nodes registered successfully${NC}"
@@ -212,24 +214,24 @@ fi
 echo ""
 
 # =============================================================================
-# TEST 5 — Fault tolerance (node goes silent)
+# TEST 5 — Fault tolerance
 # =============================================================================
 echo -e "${BLUE}[TEST 5] Fault tolerance — node goes silent, should be marked DEAD after 30s${NC}"
 echo -e "${YELLOW}  Note: this test takes 35 seconds to complete...${NC}"
 
-python3 -c "
+python3 << 'PYEOF'
 import zmq, json, time
 ctx = zmq.Context()
 sock = ctx.socket(zmq.PUSH)
-sock.connect('tcp://$COORDINATOR_HOST:$HEARTBEAT_PORT')
-time.sleep(0.3)
+sock.connect('tcp://localhost:5556')
+time.sleep(1.5)
 
 ping = {'node_id': 'node-fault-01', 'host_ip': '192.168.1.99', 'uptime_sec': 10}
 sock.send_string(json.dumps(ping))
 print('  Registered node-fault-01')
 time.sleep(0.5)
 print('  Node-fault-01 going silent now...')
-"
+PYEOF
 
 echo "  Waiting 35 seconds for dead threshold..."
 sleep 35
