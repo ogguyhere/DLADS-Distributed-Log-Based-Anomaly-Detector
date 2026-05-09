@@ -12,3 +12,31 @@ publisher:
   endpoint: "tcp://*:5555"
   queue_capacity: 1024
   drop_warn_threshold_pct: 1
+
+
+# DLADS Agent Configuration
+
+# ── SSH Brute Force (SSH_BRUTE_FORCE_001) ─────────────────────────────────────
+# Fire after this many failed logins from one IP within window_seconds.
+# Lowered from default 10 → 5 so 6 test injections trigger it.
+window_seconds: 60
+threshold: 5
+cooldown_seconds: 120
+
+# ── Port Scan (PORT_SCAN_001) ──────────────────────────────────────────────────
+# Fire after this many distinct destination ports hit by one IP within window.
+# Rule looks for kernel iptables REJECT lines with DPT=<port>.
+scan_window_seconds: 30
+scan_threshold: 15
+scan_cooldown_seconds: 60
+
+# ── Privilege Escalation (PRIV_ESC_001) ───────────────────────────────────────
+# Fire on first-ever sudo session open within this history window.
+priv_history_hours: 24
+priv_cooldown_seconds: 300
+
+# ── Multi-Service Auth Failure (MULTI_SERVICE_AUTH_001) ───────────────────────
+# Fire when one IP fails auth on this many distinct services within window.
+multi_window_seconds: 300
+multi_min_services: 2
+multi_cooldown_seconds: 180
