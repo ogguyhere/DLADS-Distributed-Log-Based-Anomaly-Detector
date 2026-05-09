@@ -48,6 +48,7 @@ add_library(dlads_core STATIC
   src/log_parser.cpp
   src/alert_event.cpp
   src/rule_engine.cpp
+  src/alert_publisher.cpp
 )
 
 target_include_directories(dlads_core PUBLIC include)
@@ -87,7 +88,7 @@ target_link_libraries(dlads_coordinator PRIVATE
   dlads_core
   ${ZMQ_LIBRARIES}
   cppzmq
-  SQLite3::SQLite3
+  SQLite::SQLite3
   Threads::Threads
 )
 # ─────────────────────────────────────────────
@@ -132,3 +133,7 @@ add_test(NAME ZScoreTests COMMAND test_zscore)
 add_executable(test_rule_engine tests/test_rule_engine.cpp)
 target_link_libraries(test_rule_engine PRIVATE dlads_core GTest::gtest_main)
 add_test(NAME RuleEngineTests COMMAND test_rule_engine)
+
+add_executable(test_alert_publisher tests/test_alert_publisher.cpp)
+target_link_libraries(test_alert_publisher PRIVATE dlads_core GTest::gtest_main)
+add_test(NAME AlertPublisherTests COMMAND test_alert_publisher)
