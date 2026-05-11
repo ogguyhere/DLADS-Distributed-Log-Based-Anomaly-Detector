@@ -162,7 +162,7 @@ public:
             const EventIndex&            index,
             const RuleConfig&            cfg) override
     {
-        if (event.log_source != "sshd") return std::nullopt;
+        if (event.log_source != "sshd" && event.log_source != "sshd-session") return std::nullopt;
         if (!icontains(event.message, "Failed password") &&
             !icontains(event.message, "Invalid user"))
             return std::nullopt;
@@ -176,7 +176,7 @@ public:
         int count = 1;  // include current event
         if (it != index.by_ip.end()) {
             for (const LogEvent* ev : it->second) {
-                if (ev->log_source != "sshd")      continue;
+                if (ev->log_source != "sshd" && ev->log_source != "sshd-session") continue;
                 if (ev->timestamp < cutoff)         continue;
                 if (!icontains(ev->message, "Failed password") &&
                     !icontains(ev->message, "Invalid user"))   continue;
