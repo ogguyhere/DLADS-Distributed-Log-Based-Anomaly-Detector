@@ -3,6 +3,7 @@
 #include "dlads/alert_store.hpp"
 #include "dlads/node_registry.hpp"
 #include "httplib.h"
+#include <ctime>
 #include <zmq.hpp>
 #include <iostream>
 #include <thread>
@@ -282,6 +283,47 @@ void rest_api(
             ",\"total_threats\":" + std::to_string(store.threat_count())  +
             ",\"active_nodes\":"  + std::to_string(registry.alive_count()) + "}";
         res.set_content(json, "application/json"); });
+
+    svr.Get("/status", [&](const httplib::Request &, httplib::Response &res)
+    {
+        auto nodes = registry.all_nodes();
+        std::string node_id    = nodes.empty() ? "unknown" : nodes[0].node_id;
+        std::string host_ip    = nodes.empty() ? "" : nodes[0].host_ip;
+        bool zmq_connected     = !nodes.empty() && nodes[0].status == dlads::NodeStatus::ALIVE;
+        std::string json =
+            "{\"node_id\":\"" + node_id + "\","
+            + "\"watch_file\":\"\","
+            + "\"coordinator_ip\":\"" + host_ip + "\","
+            + "\"ids_mode\":\"builtin\","
+            + "\"uptime_sec\":0,"
+            + "\"zmq_connected\":" + (zmq_connected ? "true" : "false") + "}";
+        res.set_content(json, "application/json");
+    });
+
+    svr.Get("/feed", [&](const httplib::Request &, httplib::Response &res)
+    {
+        auto alerts = store.get_recent_alerts();
+        std::string json = "[";
+        for (size_t i = 0; i < alerts.size(); i++) {
+            const auto& a = alerts[i];
+            // Convert chrono timestamp to ISO string
+            auto tt  = std::chrono::system_clock::to_time_t(a.timestamp);
+            char tsbuf[32];
+            std::strftime(tsbuf, sizeof(tsbuf), "%Y-%m-%dT%H:%M:%S", std::localtime(&tt));
+            // Pull attacker IP from metadata if present
+            std::string src_ip = a.source_host;
+            auto it = a.metadata.find("src_ip");
+            if (it != a.metadata.end()) src_ip = it->second;
+            json += std::string("{\"timestamp\":\"") + tsbuf + "\","
+                  + "\"raw_line\":\"" + a.source_host + " — " + a.description + "\","
+                  + "\"stage\":\"alert\","
+                  + "\"detail\":\"" + a.rule_id + "\","
+                  + "\"severity\":\"" + std::string(dlads::to_string(a.severity)) + "\"}";
+            if (i + 1 < alerts.size()) json += ",";
+        }
+        json += "]";
+        res.set_content(json, "application/json");
+    });
 
     std::cout << "[coordinator] REST API listening on port 8080\n";
     svr.listen("0.0.0.0", 8080);

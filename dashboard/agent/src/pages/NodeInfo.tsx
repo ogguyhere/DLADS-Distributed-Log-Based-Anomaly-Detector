@@ -37,7 +37,7 @@ export default function NodeInfo() {
 
       {error && (
         <div className="font-mono text-xs text-red mb-4 bg-red/10 border border-red/20 rounded p-3">
-          ✗ Cannot reach agent API at localhost:8081 — is the agent running?
+          ✗ Cannot reach coordinator API at localhost:8080 — is the coordinator running?
         </div>
       )}
 
@@ -66,7 +66,7 @@ export default function NodeInfo() {
         {[
           { port: '5555', label: 'ZMQ PUB → coordinator alerts' },
           { port: '5556', label: 'ZMQ PUSH → coordinator heartbeat' },
-          { port: '8081', label: 'HTTP REST API (this dashboard)' },
+          { port: '8080', label: 'HTTP REST API (this dashboard)' },
         ].map(({ port, label }) => (
           <div key={port} className="flex items-center gap-4 py-2 border-b border-border last:border-0">
             <span className="font-mono text-xs text-cyan w-12">{port}</span>

@@ -7,8 +7,9 @@ interface Alert {
   rule_id: string
   severity: string
   description: string
-  src_ip: string
-  timestamp_ms: number
+  source_host: string
+  timestamp: number
+  metadata: { src_ip?: string; attempt_count?: string }
 }
 
 export default function Alerts() {
@@ -20,7 +21,7 @@ export default function Alerts() {
 
   const alerts = (data ?? [])
     .filter(a => sevFilter === 'ALL' || a.severity === sevFilter)
-    .filter(a => !ipFilter || a.src_ip.includes(ipFilter))
+    .filter(a => !ipFilter || (a.metadata?.src_ip ?? '').includes(ipFilter))
     .filter(a => !ruleFilter || a.rule_id.toLowerCase().includes(ruleFilter.toLowerCase()))
 
   const counts = (data ?? []).reduce((acc, a) => {
@@ -30,19 +31,17 @@ export default function Alerts() {
 
   return (
     <div className="flex flex-col h-full">
-      {/* Header */}
       <div className="px-6 py-5 border-b border-border">
         <h1 className="font-mono text-bright text-lg font-semibold tracking-wider">ALERTS</h1>
         <p className="text-dim text-xs font-mono mt-0.5">all rule-engine detections this session</p>
       </div>
 
-      {/* Counters */}
       <div className="px-6 py-4 border-b border-border grid grid-cols-4 gap-3">
         {[
-          { label: 'TOTAL',    val: data?.length ?? 0,       col: 'text-cyan'   },
-          { label: 'CRITICAL', val: counts.CRITICAL ?? 0,    col: 'text-red'    },
-          { label: 'HIGH',     val: counts.HIGH ?? 0,        col: 'text-orange' },
-          { label: 'MEDIUM',   val: counts.MEDIUM ?? 0,      col: 'text-yellow' },
+          { label: 'TOTAL',    val: data?.length ?? 0,    col: 'text-cyan'   },
+          { label: 'CRITICAL', val: counts.CRITICAL ?? 0, col: 'text-red'    },
+          { label: 'HIGH',     val: counts.HIGH ?? 0,     col: 'text-orange' },
+          { label: 'MEDIUM',   val: counts.MEDIUM ?? 0,   col: 'text-yellow' },
         ].map(({ label, val, col }) => (
           <div key={label} className="bg-panel border border-border rounded p-3">
             <div className="font-mono text-xs text-dim tracking-widest">{label}</div>
@@ -51,7 +50,6 @@ export default function Alerts() {
         ))}
       </div>
 
-      {/* Filters */}
       <div className="px-6 py-3 border-b border-border flex gap-3 flex-wrap items-center">
         <input
           placeholder="filter by IP..."
@@ -80,7 +78,6 @@ export default function Alerts() {
         ))}
       </div>
 
-      {/* Table */}
       <div className="flex-1 overflow-y-auto">
         {error && (
           <div className="font-mono text-xs text-red px-6 py-4">
@@ -92,23 +89,27 @@ export default function Alerts() {
             no alerts yet — run attack script to generate detections
           </div>
         )}
-        {alerts.map(a => (
-          <div key={a.alert_id}>
+        {alerts.map((a, i) => (
+          <div key={`${a.alert_id}-${i}`}>
             <button
-              onClick={() => setExpanded(expanded === a.alert_id ? null : a.alert_id)}
+              onClick={() => setExpanded(expanded === `${a.alert_id}-${i}` ? null : `${a.alert_id}-${i}`)}
               className="w-full text-left px-6 py-3 border-b border-border hover:bg-panel/50 transition-colors"
             >
               <div className="flex items-center gap-4">
                 <SevBadge sev={a.severity} small />
                 <span className="font-mono text-xs text-cyan flex-1 truncate">{a.rule_id}</span>
-                <span className="font-mono text-xs text-text truncate max-w-xs hidden md:block">{a.src_ip || '—'}</span>
-                <span className="font-mono text-[10px] text-dim ml-auto shrink-0">
-                  {new Date(a.timestamp_ms).toLocaleTimeString()}
+                <span className="font-mono text-xs text-text truncate max-w-xs hidden md:block">
+                  {a.metadata?.src_ip ?? '—'}
                 </span>
-                <span className="text-dim text-xs">{expanded === a.alert_id ? '▲' : '▼'}</span>
+                <span className="font-mono text-[10px] text-dim ml-auto shrink-0">
+                  {new Date(a.timestamp * 1000).toLocaleTimeString()}
+                </span>
+                <span className="text-dim text-xs">
+                  {expanded === `${a.alert_id}-${i}` ? '▲' : '▼'}
+                </span>
               </div>
             </button>
-            {expanded === a.alert_id && (
+            {expanded === `${a.alert_id}-${i}` && (
               <div className="px-6 py-4 bg-panel border-b border-border animate-fade-in">
                 <div className="grid grid-cols-2 gap-4 font-mono text-xs">
                   <div>
@@ -117,7 +118,15 @@ export default function Alerts() {
                   </div>
                   <div>
                     <div className="text-dim mb-1">SOURCE IP</div>
-                    <div className="text-cyan">{a.src_ip || '—'}</div>
+                    <div className="text-cyan">{a.metadata?.src_ip ?? '—'}</div>
+                  </div>
+                  <div>
+                    <div className="text-dim mb-1">HOST</div>
+                    <div className="text-text">{a.source_host}</div>
+                  </div>
+                  <div>
+                    <div className="text-dim mb-1">ATTEMPTS</div>
+                    <div className="text-text">{a.metadata?.attempt_count ?? '—'}</div>
                   </div>
                   <div className="col-span-2">
                     <div className="text-dim mb-1">DESCRIPTION</div>
@@ -125,7 +134,7 @@ export default function Alerts() {
                   </div>
                   <div>
                     <div className="text-dim mb-1">TIMESTAMP</div>
-                    <div className="text-text">{new Date(a.timestamp_ms).toISOString()}</div>
+                    <div className="text-text">{new Date(a.timestamp * 1000).toISOString()}</div>
                   </div>
                 </div>
               </div>

@@ -108,7 +108,7 @@ if [ "$RUN_ATTACK" = "attack" ]; then
 fi
 
 log "System live:"
-echo "  Agent API:   http://localhost:8081"
+echo "  Agent API:   http://localhost:8080"
 echo "  Dashboard:   http://localhost:5173  (run: cd dashboard/agent && npm run dev)"
 echo "  Coord API:   http://localhost:8080"
 echo "  Agent log:   tail -f /tmp/dlads_agent1.log"

@@ -94,7 +94,7 @@ make_timepoint(int year, int mon0, int mday,
     tm.tm_min  = min;
     tm.tm_sec  = sec;
     tm.tm_isdst = 0;
-    std::time_t t = ::timegm(&tm);
+    std::time_t t = ::mktime(&tm);
     if (t == static_cast<std::time_t>(-1))
         return std::chrono::system_clock::time_point{};
     return std::chrono::system_clock::from_time_t(t);
