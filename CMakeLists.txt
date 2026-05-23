@@ -37,7 +37,7 @@ target_include_directories(cppzmq INTERFACE ${CMAKE_SOURCE_DIR}/include)
 # GoogleTest
 find_package(GTest REQUIRED)
 
-# Include paths (modern CMake already handles this via targets, but keeping for safety)
+# Include paths
 include_directories(include)
 
 # ─────────────────────────────────────────────
@@ -49,6 +49,7 @@ add_library(dlads_core STATIC
   src/alert_event.cpp
   src/rule_engine.cpp
   src/alert_publisher.cpp
+  src/suricata_adapter.cpp   # <── IDS integration
 )
 
 target_include_directories(dlads_core PUBLIC include)
@@ -64,24 +65,20 @@ target_link_libraries(dlads_core PUBLIC
 # Agent binary
 # ─────────────────────────────────────────────
 add_executable(dlads_agent src/agent_main.cpp)
-
 target_link_libraries(dlads_agent PRIVATE dlads_core)
 
 # ─────────────────────────────────────────────
 # Subscriber binary
 # ─────────────────────────────────────────────
 add_executable(dlads_subscriber src/subscriber.cpp)
-
 target_link_libraries(dlads_subscriber PRIVATE dlads_core ${ZMQ_LIBRARIES} cppzmq)
 
-
 # ─────────────────────────────────────────────
-# SQLite 
+# SQLite
 # ─────────────────────────────────────────────
-
 find_package(SQLite3 REQUIRED)
 
-# Coordinator binary (Person B - Final I)
+# Coordinator binary
 add_executable(dlads_coordinator src/coordinator.cpp)
 target_include_directories(dlads_coordinator PRIVATE include)
 target_link_libraries(dlads_coordinator PRIVATE
@@ -91,10 +88,10 @@ target_link_libraries(dlads_coordinator PRIVATE
   SQLite::SQLite3
   Threads::Threads
 )
+
 # ─────────────────────────────────────────────
 # Dashboard
 # ─────────────────────────────────────────────
-# Dashboard binary (Person B - Final II)
 find_package(CURL REQUIRED)
 add_executable(dlads_dashboard src/dashboard.cpp)
 target_include_directories(dlads_dashboard PRIVATE include)
